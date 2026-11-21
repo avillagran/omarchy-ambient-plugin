@@ -1,0 +1,199 @@
+#!/bin/bash
+
+# Tests for bin/ambient-engine, against a fake Ambient and a fake curl, and for
+# Ambient.js in Node. Nothing here touches the real Ambient, the network or the
+# shell. The tests remove no folders: their scratch folder is left in TMPDIR.
+#
+# To also check a real download end to end, put the pinned release files
+# (install.sh at the pinned commit and the bundle for this machine) in a folder
+# and set AMBIENT_PLUGIN_RELEASE_FILES to it. Their script is never run: a stub
+# stands in for it.
+
+set -uo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+engine=$root/bin/ambient-engine
+work=$(mktemp -d "${TMPDIR:-/tmp}/ambient-plugin-test.XXXXXXXX")
+
+failures=0
+pass() { printf 'ok   %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
+
+home=$work/home
+stubs=$work/stubs
+sys=$work/system
+runtime=$work/runtime
+files=$work/files
+mkdir -p "$home/.local/bin" "$stubs" "$sys/bin" "$sys/share" "$runtime" "$files"
+chmod 700 "$runtime"
+
+# A fake omarchy-ambient: its answers come from files in the fake home.
+fake_ambient() {
+  cat >"$1" <<'EOF'
+#!/bin/bash
+log=$HOME/ambient.log
+printf '%s\n' "$*" >>"$log"
+case $1 in
+  status) cat "$HOME/status" 2>/dev/null || echo none ;;
+  screensaver) echo text ;;
+  battery)
+    case $2 in
+      --get) echo 20fps ;;
+      --available) [[ -f $HOME/charger ]] ;;
+    esac ;;
+  list) cat "$HOME/list" ;;
+esac
+EOF
+  chmod +x "$1"
+}
+
+engine_run() {
+  HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share" \
+    XDG_RUNTIME_DIR="${TEST_RUNTIME-$runtime}" PATH="$stubs:/usr/bin:/bin" \
+    AMBIENT_PLUGIN_SYSTEM_BIN="$sys/bin" AMBIENT_PLUGIN_SYSTEM_SHARE="$sys/share" \
+    /usr/bin/bash "$engine" "$@"
+}
+
+field() { awk -F '\t' -v k="$1" '$1 == k { print $2 }' <<<"$output"; }
+
+# --- nothing installed -----------------------------------------------------------
+output=$(engine_run state)
+[[ $(field where) == none && $(field pin) =~ ^[0-9.]+$ && $(grep -c '^S' <<<"$output") == 0 ]] \
+  && pass "without Ambient the state says none and lists no scenes" || fail "none state: $output"
+
+# --- a user copy -----------------------------------------------------------------
+fake_ambient "$home/.local/bin/omarchy-ambient"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"$HOME/select.log"\n' >"$home/.local/bin/omarchy-ambient-select"
+chmod +x "$home/.local/bin/omarchy-ambient-select"
+mkdir -p "$home/.local/share/omarchy-ambient/selector" "$home/.config/omarchy/plugins/avillagran.ambient-selector/v0.6.1"
+: >"$home/.local/share/omarchy-ambient/selector/installed-sources"
+{
+  printf 'Sand Clock\tsand-clock\t\tThe time in sand\t\xf3\xb0\xa5\x94\n'
+  printf 'Bad\t../../etc\t\tpath\tx\n'
+  printf 'Bad Upper\tSand\t\tcase\tx\n'
+  printf '<img src=http://x>\e]52;c;SGk=\a Evil\tevil\t\t\e[31mred\e[0m\tx\n'
+  printf 'Long\t%s\t\tlong id\tx\n' "$(printf 'a%.0s' {1..60})"
+  for i in $(seq 1 200); do printf 'Scene %s\tscene-%s\t\td\tx\n' "$i" "$i"; done
+} >"$home/list"
+echo sand-clock >"$home/status"
+
+output=$(engine_run state)
+[[ $(field where) == user && $(field version) == 0.6.1 && $(field background) == sand-clock && $(field battery) == 20fps && $(field charger) == 0 ]] \
+  && pass "a user copy reports its version, scene and battery mode" || fail "user state: $(grep -v '^S' <<<"$output")"
+[[ $(grep -cP '^S\tsand-clock\tSand Clock\t' <<<"$output") == 1 ]] && pass "a scene keeps its name and glyph" || fail "scene line"
+grep -qP '^S\t(\.\./\.\./etc|Sand)\t' <<<"$output" && fail "an invalid id got through" || pass "invalid scene ids are dropped"
+grep -qP '^S\ta{49,}' <<<"$output" && fail "an overlong id got through" || pass "overlong ids are dropped"
+evil=$(grep -P '^S\tevil\t' <<<"$output")
+[[ -n $evil && $evil != *$'\e'* && $evil != *$'\a'* && $(awk -F '\t' '{print NF}' <<<"$evil") == 5 ]] \
+  && pass "control characters are stripped and a scene stays one line" || fail "evil scene: $(cat -A <<<"$evil")"
+(( $(grep -c '^S' <<<"$output") <= 96 )) && pass "the scene count is capped" || fail "scene cap"
+(( ${#output} <= 65536 )) && pass "the state is capped in bytes" || fail "state size ${#output}"
+
+touch "$home/charger"
+output=$(engine_run state)
+[[ $(field charger) == 1 ]] && pass "a charger is reported" || fail "charger"
+
+# --- verbs ---------------------------------------------------------------------
+: >"$home/ambient.log"
+engine_run start neon-city && engine_run stop && engine_run battery off
+[[ $(cat "$home/ambient.log") == $'start neon-city\nstop\nbattery --set off' ]] \
+  && pass "start, stop and battery pass only fixed arguments" || fail "verbs: $(cat "$home/ambient.log")"
+
+: >"$home/ambient.log"
+for bad in "start ../x" "start -h" "start -" "start" "start a b" "battery max" "choose files" "nonsense"; do
+  # shellcheck disable=SC2086
+  engine_run $bad 2>/dev/null && fail "accepted: $bad"
+done
+[[ ! -s $home/ambient.log ]] && pass "invalid verbs and scenes never reach Ambient" || fail "reached: $(cat "$home/ambient.log")"
+
+engine_run choose screensaver && engine_run choose random
+[[ $(cat "$home/select.log") == $'screensaver\nrandom' ]] && pass "choose opens Ambient's selector" || fail "choose: $(cat "$home/select.log")"
+
+# --- a system copy wins and is never managed -----------------------------------
+fake_ambient "$sys/bin/omarchy-ambient"
+fake_ambient "$sys/bin/omarchy-ambient-select"
+mkdir -p "$sys/share/plugin/v0.6.3"
+output=$(engine_run state)
+[[ $(field where) == system ]] && pass "a packaged Ambient is reported as the system's" || fail "system: $(field where)"
+output=$(engine_run get </dev/null 2>&1)
+[[ $output == *"comes with this system"* ]] && pass "get leaves a packaged Ambient alone" || fail "get on system: $output"
+output=$(engine_run remove </dev/null 2>&1)
+[[ $output == *"no copy of Ambient for this user"* ]] && pass "remove leaves a packaged Ambient alone" || fail "remove on system: $output"
+mv "$sys/bin" "$work/system-bin-off"
+mkdir -p "$sys/bin"
+
+# --- get: nothing runs unless both downloads match ----------------------------
+# The fake curl serves files from $files by the URL's last path segment.
+cat >"$stubs/curl" <<'EOF'
+#!/bin/bash
+dest="" url=""
+while (($#)); do
+  case $1 in
+    -o) dest=$2; shift ;;
+    --) url=$2; shift ;;
+  esac
+  shift
+done
+printf '%s\n' "$url" >>"$CURL_LOG"
+src=$FILES/${url##*/}
+[[ -f $src ]] || exit 22
+cp "$src" "$dest"
+EOF
+# Stands in for Ambient's script: records that it ran and how.
+cat >"$stubs/bash" <<'EOF'
+#!/bin/bash
+printf 'RAN %s release=%s\n' "$*" "${OMARCHY_AMBIENT_RELEASE:-}" >>"$RAN_LOG"
+EOF
+chmod +x "$stubs/curl" "$stubs/bash"
+export CURL_LOG=$work/curl.log RAN_LOG=$work/ran.log FILES=$files
+
+case $(uname -m) in
+  x86_64) bundle=omarchy-ambient-bundle-x86_64.tar.gz ;;
+  aarch64) bundle=omarchy-ambient-bundle-aarch64.tar.gz ;;
+esac
+
+printf 'echo not the pinned script\n' >"$files/install.sh"
+printf 'not the pinned bundle' >"$files/$bundle"
+: >"$RAN_LOG"
+output=$(printf 'y\n\n' | engine_run get 2>&1)
+[[ ! -s $RAN_LOG && $output == *"does not match this plugin's checksum"* ]] \
+  && pass "a script that does not match is never run" || fail "mismatch: $output / $(cat "$RAN_LOG")"
+[[ -z $(find "$runtime" -mindepth 1 -maxdepth 1) ]] && pass "the private download folder is cleaned up" || fail "leftovers in runtime"
+grep -q '^https://raw.githubusercontent.com/avillagran/omarchy-ambient/[0-9a-f]\{40\}/install.sh$' "$CURL_LOG" \
+  && pass "the script comes from a full commit hash" || fail "script url: $(cat "$CURL_LOG")"
+
+: >"$RAN_LOG"
+output=$(printf 'n\n\n' | engine_run get 2>&1)
+[[ ! -s $RAN_LOG && $output == *"Nothing was changed"* ]] && pass "saying no changes nothing" || fail "decline: $output"
+
+output=$(TEST_RUNTIME="" engine_run get <<<$'y\n\n' 2>&1)
+[[ ! -s $RAN_LOG && $output == *"XDG_RUNTIME_DIR is missing"* ]] && pass "without a runtime directory it stops instead of using /tmp" || fail "no runtime: $output"
+
+if [[ -n ${AMBIENT_PLUGIN_RELEASE_FILES:-} && -f $AMBIENT_PLUGIN_RELEASE_FILES/install.sh && -f $AMBIENT_PLUGIN_RELEASE_FILES/$bundle ]]; then
+  cp "$AMBIENT_PLUGIN_RELEASE_FILES/install.sh" "$AMBIENT_PLUGIN_RELEASE_FILES/$bundle" "$files/"
+  : >"$RAN_LOG"
+  output=$(printf 'y\n\n' | engine_run get 2>&1)
+  if grep -q "^RAN $runtime/ambient-plugin\.[A-Za-z0-9]*/install.sh release=file://$runtime/ambient-plugin\." "$RAN_LOG"; then
+    pass "matching files run the pinned script on the checked folder"
+  else
+    fail "real files: $output / $(cat "$RAN_LOG")"
+  fi
+  : >"$RAN_LOG"
+  output=$(printf 'y\n\n' | engine_run remove 2>&1)
+  grep -q '^RAN .*/install.sh --uninstall release=$' "$RAN_LOG" \
+    && pass "remove runs the pinned script with --uninstall" || fail "remove: $output / $(cat "$RAN_LOG")"
+else
+  echo "skip real download check (set AMBIENT_PLUGIN_RELEASE_FILES)"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  if node "$root/tests/ambient.test.js"; then pass "Ambient.js"; else fail "Ambient.js"; fi
+else
+  echo "skip Ambient.js (node not installed)"
+fi
+
+if ((failures)); then
+  echo "$failures failed (scratch: $work)"
+  exit 1
+fi
+echo "all passed"

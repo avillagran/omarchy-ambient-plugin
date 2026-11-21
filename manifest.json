@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.avillagran.ambient",
+  "name": "Ambient",
+  "version": "0.1.0",
+  "author": "Andrés Villagrán",
+  "license": "MIT",
+  "description": "Live backgrounds and screensavers drawn from text on the GPU: sand clocks, neon cities, black holes and more than thirty other scenes that follow the cursor and the music.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Ambient",
+    "description": "Pick a live background or screensaver, and get Ambient if it is not there yet.",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

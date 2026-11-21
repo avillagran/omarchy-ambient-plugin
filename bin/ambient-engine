@@ -1,0 +1,289 @@
+#!/bin/bash
+
+# The plugin's only way into omarchy-ambient. The panel runs it as the
+# logged-in user with one fixed verb:
+#
+#   state                        what is there, for the panel (bounded output)
+#   start <scene>                start a scene as the live background
+#   stop                         back to the wallpaper
+#   choose background|screensaver|random
+#                                open Ambient's own carousel, or pick at random
+#   battery full|20fps|off       what live backgrounds do on battery
+#   get                          (in a terminal) add or update Ambient for this user
+#   remove                       (in a terminal) take that copy of Ambient away again
+#
+# `get` and `remove` never run code they have not checked first: Ambient's
+# user script comes from one fixed commit and the bundle from one fixed release,
+# and both must match the SHA-256 digests written below before anything runs.
+# Nothing here asks for a password or runs as root.
+
+set -uo pipefail
+umask 077
+
+# The Ambient release this plugin version brings, and the digests of its files.
+readonly PIN_VERSION=0.6.3
+readonly PIN_COMMIT=0ef4a6054c0ff11b790225f3c39feaa289fca12f
+readonly PIN_SCRIPT_SHA256=842490b048704eabd823c6a2dd2a5b488833dc47591a0aef09cc0f01bbf673c6
+readonly PIN_BUNDLE_X86_64_SHA256=e85ea628949377bca542b69219b950d9ea09d2292fb4bc1073353d37ad2fd4fb
+readonly PIN_BUNDLE_AARCH64_SHA256=d0c67f78466af1e1ec648c234afb6326a04a472b2141d2976b8296bd54dfd56a
+
+readonly REPO=avillagran/omarchy-ambient
+readonly SCRIPT_URL=https://raw.githubusercontent.com/$REPO/$PIN_COMMIT/install.sh
+readonly RELEASE_URL=https://github.com/$REPO/releases/download/v$PIN_VERSION
+readonly RELEASE_API=https://api.github.com/repos/$REPO/releases/tags/v$PIN_VERSION
+
+readonly SCRIPT_MAX=65536        # the script is about 14 KiB
+readonly BUNDLE_MAX=16777216     # each bundle is about 6 MiB
+readonly API_MAX=262144
+readonly STATE_MAX=65536
+readonly SCENES_MAX=96
+
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+data=${XDG_DATA_HOME:-$HOME/.local/share}
+# Tests point these at a fake system.
+system_bin=${AMBIENT_PLUGIN_SYSTEM_BIN:-/usr/bin}
+system_share=${AMBIENT_PLUGIN_SYSTEM_SHARE:-/usr/share/omarchy-ambient}
+user_bin=$HOME/.local/bin
+user_marker=$data/omarchy-ambient/selector/installed-sources
+user_plugin=$config/omarchy/plugins/avillagran.ambient-selector
+
+die() { printf 'ambient: %s\n' "$*" >&2; exit 1; }
+
+# Where Ambient comes from: the system (a package), this user (Ambient's own
+# user script, which this plugin can also run), somewhere else, or nowhere.
+where() {
+  if [[ -x $system_bin/omarchy-ambient-select ]]; then
+    echo system
+  elif [[ -f $user_marker && -x $user_bin/omarchy-ambient ]]; then
+    echo user
+  elif command -v omarchy-ambient >/dev/null 2>&1; then
+    echo other
+  else
+    echo none
+  fi
+}
+
+ambient_cmd() {
+  local name=$1
+  if [[ -x $system_bin/$name ]]; then
+    printf '%s\n' "$system_bin/$name"
+  elif [[ -x $user_bin/$name ]]; then
+    printf '%s\n' "$user_bin/$name"
+  else
+    command -v "$name" 2>/dev/null
+  fi
+}
+
+# Ambient's selector plugin loads from a v<version> directory.
+installed_version() {
+  local dir found=""
+  for dir in "$system_share"/plugin/v* "$user_plugin"/v*; do
+    [[ -d $dir ]] || continue
+    dir=${dir##*/v}
+    [[ $dir =~ ^[0-9]+(\.[0-9]+){0,3}$ ]] && found=$dir
+  done
+  printf '%s\n' "$found"
+}
+
+# A short answer from Ambient, bounded in time and bytes, one word.
+word() {
+  local out
+  out=$(timeout -k 1 5 "$@" 2>/dev/null </dev/null | head -c 256 | head -n 1) || true
+  out=${out%%[[:space:]]*}
+  [[ $out =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] && printf '%s\n' "$out"
+}
+
+state() {
+  local w ambient
+  w=$(where)
+  printf 'where\t%s\n' "$w"
+  printf 'pin\t%s\n' "$PIN_VERSION"
+  printf 'version\t%s\n' "$(installed_version)"
+  [[ $w == none ]] && return 0
+  ambient=$(ambient_cmd omarchy-ambient) || return 0
+  printf 'background\t%s\n' "$(word "$ambient" status)"
+  printf 'screensaver\t%s\n' "$(word "$ambient" screensaver --get)"
+  printf 'battery\t%s\n' "$(word "$ambient" battery --get)"
+  if timeout -k 1 5 "$ambient" battery --available >/dev/null 2>&1 </dev/null; then
+    printf 'charger\t1\n'
+  else
+    printf 'charger\t0\n'
+  fi
+  # name, id, choice, description, glyph. Control characters are dropped and
+  # every field is cut short, so a scene can only ever be one line of text.
+  timeout -k 1 5 "$ambient" list background 2>/dev/null </dev/null | head -c "$STATE_MAX" |
+    LC_ALL=C tr -d '\000-\010\013-\037\177' |
+    awk -F '\t' -v max="$SCENES_MAX" '
+      NF >= 2 && $2 ~ /^[a-z0-9][a-z0-9-]*$/ && length($2) <= 48 && n < max {
+        n++
+        printf "S\t%s\t%s\t%s\t%s\n", $2, substr($1, 1, 64), substr($4, 1, 200), substr($5, 1, 8)
+      }'
+}
+
+valid_scene() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; }
+
+run_ambient() {
+  local ambient
+  ambient=$(ambient_cmd omarchy-ambient) || die "Ambient is not installed"
+  exec timeout -k 2 20 "$ambient" "$@" </dev/null
+}
+
+# --- get and remove: run in a visible terminal, ask first ----------------------
+
+say() { printf '%s\n' "$*"; }
+
+confirm() {
+  local answer
+  read -r -p "$1 [y/N] " answer || return 1
+  [[ $answer == [yY]* ]]
+}
+
+pause() {
+  local _
+  say ""
+  read -r -p 'Press Enter to close. ' _ || true
+}
+
+workdir() {
+  local runtime=${XDG_RUNTIME_DIR:-}
+  # Never a shared /tmp: the runtime directory must be ours and private.
+  [[ -n $runtime && -d $runtime && -O $runtime && ! -L $runtime ]] ||
+    die "XDG_RUNTIME_DIR is missing; open this from your desktop session"
+  work=$(mktemp -d -p "$runtime" ambient-plugin.XXXXXXXXXX) || die "could not make a private folder"
+  trap 'rm -rf -- "$work"' EXIT
+}
+
+# download <url> <dest> <max bytes>: https only, bounded in bytes and time.
+download() {
+  local url=$1 dest=$2 max=$3 size
+  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 15 --max-time 300 --max-filesize "$max" \
+    --retry 3 --retry-delay 2 -o "$dest" -- "$url" 2>/dev/null || return 1
+  size=$(stat -c %s -- "$dest" 2>/dev/null) || return 1
+  ((size > 0 && size <= max))
+}
+
+matches() { [[ $(sha256sum -- "$1" 2>/dev/null | awk '{print $1}') == "$2" ]]; }
+
+fetch_script() {
+  say "Downloading Ambient's user script from commit ${PIN_COMMIT:0:12}"
+  download "$SCRIPT_URL" "$work/install.sh" "$SCRIPT_MAX" || die "could not download the script"
+  matches "$work/install.sh" "$PIN_SCRIPT_SHA256" || die "the script does not match this plugin's checksum; nothing was changed"
+}
+
+# GitHub's download links can answer 504 for hours while its API serves the
+# same files; the digest check makes either source safe.
+fetch_bundle() {
+  local name=$1 digest=$2 url
+  say "Downloading $name from release v$PIN_VERSION"
+  if ! { download "$RELEASE_URL/$name" "$work/$name" "$BUNDLE_MAX" && matches "$work/$name" "$digest"; }; then
+    rm -f -- "$work/$name" "$work/release.json"
+    download "$RELEASE_API" "$work/release.json" "$API_MAX" || die "could not download $name"
+    url=$(jq -r --arg name "$name" 'first(.assets[]? | select(.name == $name) | .url) // empty' "$work/release.json" 2>/dev/null)
+    [[ $url == "https://api.github.com/repos/$REPO/releases/assets/"* ]] || die "could not find $name in the release"
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --connect-timeout 15 --max-time 300 --max-filesize "$BUNDLE_MAX" \
+      -H 'Accept: application/octet-stream' -o "$work/$name" -- "$url" 2>/dev/null ||
+      die "could not download $name"
+  fi
+  matches "$work/$name" "$digest" || die "$name does not match this plugin's checksum; nothing was changed"
+}
+
+newer() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]; }
+
+get() {
+  local w version arch digest bundle
+  [[ $EUID -ne 0 ]] || die "run this as your user, not as root"
+  w=$(where)
+  version=$(installed_version)
+  say "Ambient: live backgrounds and screensavers for Omarchy"
+  say ""
+  case $w in
+    system)
+      say "Ambient already comes with this system. It updates with the system."
+      return 0 ;;
+    other)
+      say "omarchy-ambient is already on this computer, installed some other way."
+      say "This plugin leaves that copy alone."
+      return 0 ;;
+  esac
+  if [[ $w == user && -n $version ]] && ! newer "$PIN_VERSION" "$version"; then
+    say "Ambient $version is already here: nothing to update."
+    return 0
+  fi
+  case $(uname -m) in
+    x86_64) arch=x86_64 digest=$PIN_BUNDLE_X86_64_SHA256 ;;
+    aarch64) arch=aarch64 digest=$PIN_BUNDLE_AARCH64_SHA256 ;;
+    *) die "$(uname -m) is not supported: Ambient runs on x86_64 and ARM64" ;;
+  esac
+  bundle=omarchy-ambient-bundle-$arch.tar.gz
+  if [[ $w == user ]]; then
+    say "This updates Ambient ${version:-?} to $PIN_VERSION, for your user."
+  else
+    say "This adds Ambient $PIN_VERSION for your user, under ~/.local. No password is needed."
+  fi
+  say ""
+  say "  1. Download Ambient's user script from github.com/$REPO at commit $PIN_COMMIT"
+  say "     and its $arch bundle from release v$PIN_VERSION."
+  say "  2. Check both against the SHA-256 digests in this plugin; stop if either differs."
+  say "  3. Run the script, which adds the commands to ~/.local/bin, the scenes, the"
+  say "     carousel plugin, Super+Ctrl+Space, and rows in the Style > Background menu."
+  say "     Anything it replaces is kept, and Remove Ambient puts it back."
+  say ""
+  confirm "Go ahead?" || { say "Nothing was changed."; return 0; }
+  say ""
+  workdir
+  fetch_script
+  fetch_bundle "$bundle" "$digest"
+  printf '%s  %s\n' "$digest" "$bundle" >"$work/SHA256SUMS"
+  say "Both files match. Running Ambient's script."
+  say ""
+  # The script reads the bundle and its checksum list from the folder just checked.
+  OMARCHY_AMBIENT_RELEASE="file://$work" bash "$work/install.sh" || die "the script stopped; see above"
+  say ""
+  say "Done. Open the Ambient panel again, or press Super+Ctrl+Space."
+}
+
+remove() {
+  local w
+  [[ $EUID -ne 0 ]] || die "run this as your user, not as root"
+  w=$(where)
+  if [[ $w != user ]]; then
+    say "There is no copy of Ambient for this user to remove."
+    [[ $w == system ]] && say "Ambient comes with this system; remove it with the system's package tools."
+    return 0
+  fi
+  say "This removes Ambient from your user: its commands, scenes, carousel plugin,"
+  say "shortcut and menu rows, and puts back anything it replaced."
+  say "Settings you edited in ~/.config/omarchy/ambient stay."
+  say ""
+  confirm "Remove Ambient?" || { say "Nothing was changed."; return 0; }
+  say ""
+  workdir
+  fetch_script
+  bash "$work/install.sh" --uninstall || die "the script stopped; see above"
+}
+
+case ${1:-} in
+  state) state | head -c "$STATE_MAX" ;;
+  start)
+    [[ $# -eq 2 ]] && valid_scene "$2" || die "usage: ambient-engine start <scene>"
+    run_ambient start "$2" ;;
+  stop) run_ambient stop ;;
+  choose)
+    case ${2:-} in
+      background | screensaver | random) ;;
+      *) die "usage: ambient-engine choose background|screensaver|random" ;;
+    esac
+    select_cmd=$(ambient_cmd omarchy-ambient-select) || die "Ambient is not installed"
+    exec "$select_cmd" "$2" </dev/null ;;
+  battery)
+    case ${2:-} in
+      full | 20fps | off) run_ambient battery --set "$2" ;;
+      *) die "usage: ambient-engine battery full|20fps|off" ;;
+    esac ;;
+  # In a subshell, so a stop on the way still leaves the terminal open to read.
+  get) (get); status=$?; pause; exit "$status" ;;
+  remove) (remove); status=$?; pause; exit "$status" ;;
+  *) die "usage: ambient-engine state | start <scene> | stop | choose <what> | battery <mode> | get | remove" ;;
+esac
