@@ -61,7 +61,7 @@ of Ambient the computer has:
   terminal that says what it will do and asks before doing anything. If you
   agree, it:
   1. downloads Ambient's user script from one fixed commit
-     (`0ef4a6054c0ff11b790225f3c39feaa289fca12f`) and the bundle for your
+     (`b10d3ebe1ce5d953b08eb1ead59184384245e9d6`) and the bundle for your
      machine from release `v0.6.3`, both over HTTPS, with size and time limits;
   2. checks both files against the SHA-256 digests written in
      [`bin/ambient-engine`](bin/ambient-engine), and stops without changing
@@ -95,6 +95,10 @@ can be taken away again:
   `~/.config/omarchy/plugins`.
 
 Anything it replaces is copied to `~/.local/share/omarchy-ambient-backup` first.
+Updates and removal only replace or delete files that are still as the script
+left them: a scene or shortcut you edit afterwards stays, and anything it
+cannot check is moved to `~/.local/share/omarchy-ambient-saved` instead of
+deleted. A file you keep as a symlink is never written through.
 
 ## Remove
 
@@ -102,7 +106,7 @@ If this plugin added Ambient, open the panel and choose **Remove Ambient**
 first. Like Get Ambient, it opens a terminal, asks, downloads the same pinned
 script, checks it, and runs it with `--uninstall`, which removes everything
 listed above and puts back what it replaced. Settings you edited in
-`~/.config/omarchy/ambient` stay. Then remove the plugin:
+`~/.config/omarchy/ambient`, and scenes you edited, stay. Then remove the plugin:
 
 ```sh
 omarchy plugin remove io.github.avillagran.ambient

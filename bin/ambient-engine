@@ -22,8 +22,8 @@ umask 077
 
 # The Ambient release this plugin version brings, and the digests of its files.
 readonly PIN_VERSION=0.6.3
-readonly PIN_COMMIT=0ef4a6054c0ff11b790225f3c39feaa289fca12f
-readonly PIN_SCRIPT_SHA256=842490b048704eabd823c6a2dd2a5b488833dc47591a0aef09cc0f01bbf673c6
+readonly PIN_COMMIT=b10d3ebe1ce5d953b08eb1ead59184384245e9d6
+readonly PIN_SCRIPT_SHA256=df79c09d96e85cdc7f03aa82f6ffaa4571226d639192a4c37375b30d71e0c65c
 readonly PIN_BUNDLE_X86_64_SHA256=e85ea628949377bca542b69219b950d9ea09d2292fb4bc1073353d37ad2fd4fb
 readonly PIN_BUNDLE_AARCH64_SHA256=d0c67f78466af1e1ec648c234afb6326a04a472b2141d2976b8296bd54dfd56a
 
@@ -32,7 +32,7 @@ readonly SCRIPT_URL=https://raw.githubusercontent.com/$REPO/$PIN_COMMIT/install.
 readonly RELEASE_URL=https://github.com/$REPO/releases/download/v$PIN_VERSION
 readonly RELEASE_API=https://api.github.com/repos/$REPO/releases/tags/v$PIN_VERSION
 
-readonly SCRIPT_MAX=65536        # the script is about 14 KiB
+readonly SCRIPT_MAX=65536        # the script is about 18 KiB
 readonly BUNDLE_MAX=16777216     # each bundle is about 6 MiB
 readonly API_MAX=262144
 readonly STATE_MAX=65536
